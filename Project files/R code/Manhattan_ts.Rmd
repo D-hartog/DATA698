@@ -1,0 +1,667 @@
+---
+title: 'Time Series: Manhattan'
+author: "Dirk Hartog"
+date: "2025-10-29"
+output: html_document
+---
+
+```{r load libraries}
+library(tidyverse)
+library(fpp3)
+library(fable)
+library(seasonal)
+library(GGally)
+```
+
+# Introduction
+
+```{r load data}
+daily_counts <- read_csv("/Users/dirkhartog/Desktop/CUNY_MSDS/DATA_698/Data/manhattan/manhattan_daily_counts.csv")
+head(daily_counts)
+
+```
+
+
+## EDA - Precinct 1
+
+```{r convert to time series}
+
+precinct1 <- daily_counts %>% filter(nypd_pct_cd == 1)
+precinct1_ts <- as_tsibble(precinct1, index = incident_date)
+head(precinct1_ts)
+```
+```{r plot time series}
+precinct1_ts %>% autoplot(counts) + labs(title = "Precinct 1 Daily Calls", x = "Date", y = "Number of calls") + theme_minimal()
+```
+```{r num unique dates in each year}
+precinct1 %>% group_by(year(incident_date)) %>% summarize(n = n())
+```
+
+```{r season plot}
+precinct1_ts %>% ggtime::gg_season(counts, period = "1w") + labs(title = "Weekly Seasonal Trends") + theme_minimal()
+```
+```{r Seasonal Decomposition}
+precinct1_ts %>% model(
+  STL(counts ~ trend(window = 13) + season(window = "periodic"), 
+  robust = TRUE)) %>% # Robust = TRUE downweights any unusual arguments
+  components() %>% 
+  autoplot() + theme_minimal()
+```
+```{r lag plots}
+ggtime::gg_lag(precinct1_ts %>% select(-nypd_pct_cd), lags = 1:14, geom = "point") + labs(title = "Lag plots: Precinct 1") + theme_minimal()
+```
+
+```{r autocorrelation plots}
+precinct1_ts %>% ACF(counts, lag_max = 42) %>% autoplot() + labs(title = "Lag plots: Precinct 1") + theme_minimal()
+
+precinct1_ts %>% PACF(counts, lag_max = 42) %>% autoplot()+ labs(title = "Lag plots: Precinct 1") + theme_minimal()
+```
+
+```{r unit root tests}
+# Check stationarity using kpss
+## p-value > 0.05 to final to reject the null hypothesis: data is stationary 
+## p-value < 0.05 differencing is necessary 
+
+precinct1_ts %>% features(counts, unitroot_kpss)
+
+# Evaluate order of differencing
+precinct1_ts %>% features(counts, unitroot_ndiffs)
+
+precinct1_ts %>% features(counts, unitroot_nsdiffs)
+```
+The kpss statistic informs that differencing is necessary and according to the unit root tests a first order difference without a seasonal difference is appropriate. We can confirm this by running a kpss test with a first order difference. 
+
+```{r recheck stationarity}
+precinct1_ts %>% features(difference(counts), unitroot_kpss)
+```
+The kpss test is above 0.05 so we reject the hypothesis that the data needs to be differenced beyond a first order trend difference. We can also run an Augmented Dickey Fuller test to evaluate if the time series is stationary.  
+
+```{r}
+library(tseries)
+counts_diff <- na.remove(difference(precinct1_ts$counts))
+
+adf.test(counts_diff, k = 14)
+```
+
+According to the Augmented Dickey-Fuller test, we can say that after a 1st order difference the data is stationary. 
+
+```{r differenced time series}
+precinct1_ts %>% autoplot(difference(counts)) + labs(title = "Daily Calls", x = "Date", y = "Call count") + theme_minimal()
+```
+
+```{r ACF/PACF with first difference, warning = FALSE}
+precinct1_ts %>% ggtime::gg_tsdisplay(difference(counts), plot_type = "partial", lag_max = 28) + theme_minimal()
+```
+Summary: 
+According to the unit root tests above the data, the data become stationary after a first order of differencing. It still appears that that there might be a need to seasonally difference the data based on the ACF plots and the spikes at lag 7,14,21 and captur alternating sinusodial waveform.  and the multiple lags in the PACF plots. 
+
+Not shown, is that the data does achieve stationarity under two separate conditions, a seasonal difference (7) and a first order difference. 
+
+```{r}
+# Re-check to determine data is white noise using ACF/PCF
+
+precinct1_ts %>% ggtime::gg_tsdisplay(difference(counts, 7), plot_type = "partial", lag_max = 28)
+```
+
+ACF: Significant spike at the seasonal 7th lag 
+PCF: Exponential decay in the seasonal lag 
+
+This suggests that there is at least 1 seasonal MA component
+
+```{r check kpss seasonal difference}
+precinct1_ts %>% features(difference(counts,7), unitroot_kpss)
+```
+
+## DATA PROCESSING 
+
+```{r split data}
+
+p1_training <- precinct1 %>% select(-nypd_pct_cd) %>% filter(incident_date <= "2025-05-31")
+p1_training <- as_tsibble(p1_training)
+
+p1_testing <- precinct1 %>% select(-nypd_pct_cd) %>% filter(incident_date > "2025-05-31")
+p1_testing <- as_tsibble(p1_testing)
+```
+
+### Feature Engineering
+
+```{r Read in holiday data}
+holidays <- read_csv("/Users/dirkhartog/Desktop/CUNY_MSDS/DATA_698/Holidays_cleaned.csv")
+head(holidays)
+holiday_dates <- unique(holidays$Date)
+
+```
+
+```{r Add features}
+p1_training <- p1_training %>% mutate(month = factor(month(incident_date)),
+                      dow = factor(weekdays(incident_date)),
+                      weekend = factor(ifelse(wday(incident_date) %in% c(1,7), 1, 0)),
+                      holiday = factor(ifelse(incident_date %in% holiday_dates, 1, 0))
+)
+
+p1_testing <- p1_testing %>% mutate(month = factor(month(incident_date), levels = levels(p1_training$month)),
+                      dow = factor(weekdays(incident_date),levels = levels(p1_training$dow)),
+                      weekend = factor(ifelse(wday(incident_date) %in% c(1,7), 1, 0)),
+                      holiday = factor(ifelse(incident_date %in% holiday_dates, 1, 0), levels = levels(p1_training$holiday))
+)
+```
+
+## BUILD MODELS
+
+### Auto ARIMA
+
+```{r fit ARIMA models}
+set.seed(100)
+fit_arima <- p1_training %>% model(
+  arima110100 = ARIMA(counts ~ pdq(1,1,0) + PDQ(1,0,0) + dow + month + holiday),
+  arima011001 = ARIMA(counts ~ pdq(0,1,1) + PDQ(0,0,1) + dow + month + holiday),
+  auto = ARIMA(counts, stepwise = FALSE, approx = FALSE)
+  
+)
+
+report(fit_arima )
+```
+
+```{r Get ARIMA model oders}
+fit_arima %>% pivot_longer(everything(), names_to = "Model name",
+                     values_to = "Orders")
+```
+
+*Investigate arima011001* 
+
+```{r Extract model coefficients}
+# glimpse(fit_arima)
+fit_arima[[2]][[1]][["fit"]][["par"]]
+```
+
+```{r arima101011 residuals}
+fit_arima %>% select(arima011001) %>% ggtime::gg_tsresiduals(lag = 21)
+```
+
+```{r check white noise}
+augment(fit_arima) %>% features(.innov, ljung_box, lag = 14, dof = 6)
+```
+
+The ljung_box statistic is below 0.05 for all ARIMA models so we reject the null hypothesis that the residuals are white noise in favor of the residuals are still correlated. This implies that important data is left in the residuals and that an attempt to improve the model should be made.
+
+```{r forecast}
+future_tbl <- new_data(p1_training, 14) %>% mutate(
+                      dow = factor(weekdays(incident_date),levels = levels(p1_training$dow)),
+                      month = factor(month(incident_date), levels = levels(p1_training$month)),
+                      holiday = factor(ifelse(incident_date %in% holiday_dates, 1, 0), levels = levels(p1_training$holiday))
+)
+
+fc_arima <- fit_arima %>% forecast(new_data = future_tbl)
+
+# fc_arima <- fit_arima %>% forecast(h = "14 days")
+
+fc_arima %>% autoplot(p1_training %>% filter(incident_date > "2025-05-01" &
+                                                incident_date < "2025-05-31"), level = NULL) +
+  labs(title = "June Forecasts: ARIMA(0,1,1)(0,0,1)", x = "Date", y = "Number of calls") + theme_minimal()
+
+```
+
+```{r ARIMA accuracy}
+
+fc_arima %>% accuracy(p1_testing)
+```
+
+### Improve on best ARIMA model include exogenous terms to an autoARIMA function
+
+```{r}
+set.seed(201)
+
+fit_arima_exo <- p1_training %>% model(
+  arima = ARIMA(counts ~ dow + month + holiday))
+
+report(fit_arima_exo)
+
+fit_arima_exo %>% ggtime::gg_tsresiduals(lag = 21) + theme_minimal()
+
+augment(fit_arima_exo) %>% features(.innov, ljung_box, lag = 14, dof = 6)
+```
+```{r}
+fc_arima_exo <- fit_arima_exo %>% forecast(new_data = p1_testing)
+
+fc_arima_exo %>% autoplot(p1_training %>% filter(incident_date > "2025-05-01" &
+                                                incident_date < "2025-05-31"), level = NULL) +
+  labs(title = "June Forecasts: ARIMA(2,1,2)(0,0,2)", x = "Date", y = "Number of calls") + theme_minimal()
+
+```
+
+```{r}
+fc_arima_exo %>% accuracy(p1_testing)
+```
+## EXPERIMENTAL MODELING 
+
+### ETS - HOLT'S WINTER
+
+```{r fit ets}
+set.seed(102)
+
+fit_ets <- p1_training %>% model(
+  additive = ETS(counts ~ error("A") + trend("A") + season("A")),
+  multiplicative = ETS(counts ~ error("M") + trend("A") + season("M")), 
+  ets = ETS(counts)
+  )
+
+
+report(fit_ets)
+```
+
+```{r View ets model}
+fit_ets %>% select(ets)
+```
+
+
+```{r}
+fc_ets <- fit_ets %>% forecast(h = "14 days")
+
+fc_ets %>% autoplot(p1_training %>% filter(incident_date > "2025-05-01" &
+                                              incident_date < "2025-06-14"))
+
+```
+
+```{r ETS accuracy}
+
+fc_ets %>% accuracy(p1_testing)
+```
+
+```{r ets diagnostics}
+augment(fit_ets) %>% features(.innov, ljung_box, lag = 14, dof = 6)
+
+fit_ets %>% select(ets) %>% ggtime::gg_tsresiduals(lag = 21)
+```
+
+
+
+Conclusion: Neither model does a good job of fitting the data and produce accurate forecasts.
+
+### ETS - EXOGENOUS VARIABLES
+
+```{r}
+library(smooth)
+
+ets_smooth <- es(ts(p1_training$counts), "MNA", silent=FALSE)
+
+```
+
+```{r}
+summary(ets_smooth)
+
+coefficients(ets_smooth)
+
+fitted(ets_smooth)
+```
+
+```{r}
+plot(ets_smooth)
+```
+
+```{r forecast}
+ets_forecast <- forecast(ets_smooth, h = 14)
+
+ets_forecast
+```
+
+
+### ARIMA with Bootstraping 
+
+```{r}
+training_stl <- p1_training %>% model(
+  stl = STL(counts ~ trend(window = 13) + season(window = "periodic"), 
+  robust = TRUE))
+
+sim <- training_stl %>% 
+  generate(new_data = p1_training, bootstrap_block_size = nrow(p1_training), times = 100) %>%
+  select(-.model, -counts)
+
+sim %>%
+  autoplot(.sim) +
+  autolayer(p1_training, counts) +
+  guides(colour = "none") +
+  labs(title = "Call count: Bootstrapped series",
+       y="Num. calls")
+
+```
+
+```{r}
+set.seed(103)
+
+arima_forecasts <- sim |>
+  model(arima101011 = ARIMA(.sim ~ pdq(2,1,2) + PDQ(0,0,2))) %>%
+  forecast(h = 30)
+```
+
+```{r}
+
+arima_forecasts %>% 
+  update_tsibble(key = .rep) %>% 
+  autoplot(.mean) +
+  autolayer(p1_training %>% filter(incident_date >= "2025-05-01"), counts) +
+  guides(colour = "none") +
+  labs(title = "Daily Call Count", x = "Date",
+       y="Num. calls") + theme_minimal()
+```
+
+
+```{r}
+bagged <- arima_forecasts %>% 
+  summarise(bagged_mean = mean(.mean, na.rm= TRUE))
+
+p1_training %>% filter(incident_date >= "2025-05-01") %>% 
+  autoplot(counts) +
+  autolayer(bagged, bagged_mean, col = "#D55E00") +
+  labs(title = "Daily Calls: Precinct 1",
+       y="Num. calls")
+```
+
+```{r bagged accuracy}
+# ALl contain the smae info
+#ets_forecasts %>% index_by(incident_date) %>% summarise(counts = mean(.mean))
+
+#aggregate(.mean ~ incident_date, data = ets_forecasts, FUN = mean)
+
+#colnames(bagged) <- c("incident_date", "counts")
+#bagged 
+
+arima_forecasts_with_actual <- arima_forecasts %>%
+  left_join(p1_testing, by = "incident_date")
+
+boot_acc <- arima_forecasts_with_actual %>% drop_na() %>% 
+  group_by(.rep) %>%
+  summarise(
+    RMSE = sqrt(mean((.mean - counts)^2, na.rm = TRUE)),
+    MAE  = mean(abs(.mean - counts), na.rm = TRUE),
+    MAPE = mean(abs((.mean - counts) / counts), na.rm = TRUE)
+  )
+
+boot_acc_summary <- boot_acc %>% drop_na() %>% 
+  summarise(
+    RMSE_mean = mean(RMSE),
+    RMSE_sd   = sd(RMSE),
+    MAE_mean  = mean(MAE),
+    MAE_sd    = sd(MAE),
+    MAPE_mean = mean(MAPE),
+    MAPE_sd   = sd(MAPE)
+  )
+
+boot_acc_summary
+mean(boot_acc_summary$RMSE_mean)
+```
+
+## REPEAT PROCESS WITH DIFFERENT PRECINCT
+
+```{r}
+# precinct14 <- daily_counts %>% filter(nypd_pct_cd == 14)
+# precinct14_ts <- as_tsibble(precinct14, index = incident_date)
+# head(precinct14_ts)
+```
+
+```{r}
+# precinct14_ts %>% autoplot(counts) + labs(title = "Daily Calls", x = "Date", y = "Call count") + theme_minimal()
+```
+
+```{r}
+# precinct14_ts %>% ggtime::gg_season(counts, period = "1w") + labs(title = "Weekly Seasonal Trends") + theme_minimal()
+```
+
+```{r}
+# precinct14_ts %>% model(
+#   STL(counts ~ trend(window = 13) + season(window = "periodic"), 
+#   robust = TRUE)) %>% # Robust = TRUE downweights any unusual arguments
+#   components() %>% 
+#   autoplot() + theme_minimal()
+```
+
+```{r}
+# ggtime::gg_lag(precinct14_ts %>% select(-nypd_pct_cd), lags = 1:14, geom = "point") + labs(title = "Lag plots") + theme_minimal()
+```
+
+```{r}
+# precinct14_ts %>% ACF(counts, lag_max = 42) %>% autoplot() + theme_minimal()
+# 
+# precinct14_ts %>% PACF(counts, lag_max = 42) %>% autoplot() + theme_minimal()
+```
+
+```{r}
+# precinct14_ts %>% features(counts, unitroot_kpss)
+```
+
+```{r}
+# # Evaluate order of differencing
+# precinct14_ts %>% features(counts, unitroot_ndiffs)
+# 
+# precinct14_ts %>% features(counts, unitroot_nsdiffs)
+```
+
+```{r}
+# precinct14_ts %>% autoplot(difference(counts)) + labs(title = "Daily Calls", x = "Date", y = "Call count") + theme_minimal()
+# 
+# precinct14_ts %>% features(difference(counts), unitroot_kpss)
+```
+
+```{r}
+# training_ts <- precinct14 %>% select(-nypd_pct_cd) %>% filter(incident_date <= "2025-06-13")
+# training_ts <- as_tsibble(training_ts)
+
+# testng_ts <- precinct14 %>% select(-nypd_pct_cd) %>% filter(incident_date > "2025-06-13")
+# testng_ts <- as_tsibble(testng_ts)
+```
+
+```{r}
+# fit_arima <- training_ts %>% model(
+#   arima101011 = ARIMA(counts ~ pdq(1,0,1) + PDQ(0,1,1)),
+#   auto = ARIMA(counts, stepwise = FALSE, approx = FALSE)
+# )
+# 
+# report(fit_arima)
+```
+
+## HIERARCHICAL FORECASTING
+
+### Forecasting daily call counts 
+
+```{r}
+# convert data to tsibble
+
+
+daily_counts_ts <- as_tsibble(daily_counts,  index = incident_date, key = nypd_pct_cd)
+
+
+daily_counts_ts <- daily_counts_ts %>% aggregate_key(nypd_pct_cd, call_counts = sum(counts))
+
+
+daily_counts_ts <- daily_counts_ts %>% mutate(month = factor(month(incident_date)),
+                      dow = factor(weekdays(incident_date)),
+                      holiday = factor(ifelse(incident_date %in% holiday_dates, 1, 0))
+)
+
+daily_counts_ts
+```
+
+```{r fit hierarchical model}
+
+fit <- daily_counts_ts %>% filter(incident_date <= "2025-05-31") %>% 
+  model(base_ets = ETS(call_counts),
+        base_arima = ARIMA(call_counts ~ month + dow + holiday)) %>% 
+  reconcile(
+    bu_ets = bottom_up(base_ets),
+    ols_ets = min_trace(base_ets, method = "ols"),
+    mint_ets = min_trace(base_ets, method = "mint_shrink"),
+    bu_arima = bottom_up(base_arima),
+    ols_arima = min_trace(base_arima, method = "ols"),
+    mint_arima = min_trace(base_arima, method = "mint_shrink")
+  )
+```
+
+```{r forecast}
+fc <- fit %>% forecast(new_data = daily_counts_ts %>% filter(incident_date > "2025-05-31"))
+```
+
+```{r view }
+fc %>% filter(nypd_pct_cd %in% c(1,5,6,7,9,10,14,22,17)) %>% autoplot(daily_counts_ts %>% filter(incident_date >= "2025-05-01" & nypd_pct_cd %in% c(1,5,6,7,9,10,14,22,17)), 
+           level = NULL) + 
+  labs(title = "30 day Forecasted Data by Precinct", y = "Call counts", x = "Date") + 
+  facet_wrap(vars(nypd_pct_cd), scales = "free_y") + 
+  theme_minimal()
+```
+
+```{r Metrics}
+report(fit)
+```
+
+```{r}
+accuracy_df <- accuracy(fc, data = daily_counts_ts)
+accuracy_df %>% filter(nypd_pct_cd == 22)
+```
+
+```{r}
+# Find the best models based on the precinct
+acc_df <- accuracy_df %>% group_by(nypd_pct_cd) %>% slice_min(RMSE, n = 1)
+acc_df
+write_csv(acc_df, "Daily_call_count_heirarchical.csv")
+
+```
+
+### Forecasting total call counts by type
+
+```{r}
+daily_counts_type <- read_csv("/Users/dirkhartog/Desktop/CUNY_MSDS/DATA_698/Data/manhattan/manhattan_dailyCIP_counts.csv")
+head(daily_counts_type)
+```
+
+```{r}
+daily_counts_type %>% group_by(nypd_pct_cd, incident_date) %>% 
+  summarize(num_cip_types = n()) %>% filter(num_cip_types <=1)
+```
+
+```{r}
+daily_counts_type %>% 
+  mutate(call_type = case_when(
+    cip_jobs == "Non CIP" ~ 1,
+    cip_jobs == "Non Critical" ~ 2,
+    cip_jobs == "Serious" ~ 3,
+    cip_jobs == "Critical" ~ 4)) %>% 
+  ggplot(aes(x = call_type, y = counts)) + geom_bar(stat = "identity") +
+  facet_wrap(~ nypd_pct_cd, nrow = 5, ncol = 6, scales = "free") + labs(title = "Values") +  
+  labs(title = "Precinct Call Count By Type",
+       y = "") + 
+  
+    theme_minimal()
+  
+```
+
+```{r}
+# Re-code call type into two distinct categories 
+daily_counts_type <- daily_counts_type %>% 
+  mutate(call_type = case_when(
+    cip_jobs == "Non CIP" ~ "Non CIP",
+    cip_jobs == "Non Critical" ~ "CIP",
+    cip_jobs == "Serious" ~ "CIP",
+    cip_jobs == "Critical" ~ "CIP"))
+
+unique(daily_counts_type$call_type)
+
+daily_counts_type_grouped <- daily_counts_type %>% group_by(nypd_pct_cd, incident_date, call_type) %>% summarise(count = sum(counts)) %>% ungroup()
+
+# Use grouped data to see which precincts and dates contain only one type of call 
+daily_counts_type_grouped %>% group_by(nypd_pct_cd, incident_date) %>% 
+  summarize(num_cip_types = n()) %>% filter(num_cip_types <= 1)
+```
+
+```{r}
+# Create time series 
+daily_counts_type_ts <- as_tsibble(daily_counts_type_grouped,  index = incident_date, key = c(nypd_pct_cd, call_type))
+
+
+daily_counts_type_ts <- daily_counts_type_ts %>% aggregate_key(nypd_pct_cd * call_type, call_counts = sum(count))
+
+daily_counts_type_ts <- daily_counts_type_ts %>% mutate(month = factor(month(incident_date)),
+                      dow = factor(weekdays(incident_date)),
+                      weekend = factor(ifelse(wday(incident_date) %in% c(1,7), 1, 0)),
+                      holiday = factor(ifelse(incident_date %in% holiday_dates, 1, 0))
+)
+daily_counts_type_ts
+```
+
+```{r}
+# Check for missing values in the time series 
+
+daily_counts_type_ts %>% count_gaps(.full = TRUE)
+```
+
+```{r}
+# Visualize the gaps in preconct - 5
+daily_counts_type_ts %>% count_gaps(.full = TRUE) %>% 
+  mutate(call_type = factor(call_type), nypd_pct_cd = factor(nypd_pct_cd)) %>% 
+  ggplot(aes(x = nypd_pct_cd, colour = call_type)) +
+  geom_linerange(aes(ymin = .from, ymax = .to)) +
+  geom_point(aes(y = .from)) +
+  geom_point(aes(y = .to)) +
+  coord_flip() +
+  theme(legend.position = "bottom") + 
+  labs(title = "Time Gaps by Call Type", x = "Date", y = "Precinct") +
+  theme_minimal()
+```
+
+```{r}
+daily_counts_type_ts <- daily_counts_type_ts %>% filter(nypd_pct_cd != 22)
+
+daily_counts_type_ts <- daily_counts_type_ts %>% fill_gaps(.full = TRUE, call_counts = 0)
+
+```
+
+
+```{r fit hierarchical model}
+fit_type <- daily_counts_type_ts %>% filter(incident_date <= "2025-05-31") %>% 
+  model(base_ets = ETS(call_counts),
+        base_arima = ARIMA(call_counts ~ month + dow + holiday)) %>% 
+  reconcile(
+    bu_ets = bottom_up(base_ets),
+    ols_ets = min_trace(base_ets, method = "ols"),
+    mint_ets = min_trace(base_ets, method = "mint_shrink"),
+    bu_arima = bottom_up(base_arima),
+    ols_arima = min_trace(base_arima, method = "ols"),
+    mint_arima = min_trace(base_arima, method = "mint_shrink")
+  )
+
+```
+
+```{r forecast}
+fc_type <- fit_type %>% forecast(daily_counts_type_ts %>% filter(incident_date > "2025-05-31"))
+```
+
+```{r view precinct 1 forecasts}
+fc_type %>% filter(nypd_pct_cd == 1) %>% 
+  autoplot(daily_counts_type_ts %>% 
+             filter(incident_date >= "2025-05-01" & nypd_pct_cd == 1), level = NULL) +
+  labs(y = "Call counts") + 
+  facet_wrap(vars(call_type), scales = "free_y")
+```
+
+```{r view }
+fc_type %>% filter(nypd_pct_cd %in% c(5,6,7)) %>% 
+  autoplot(daily_counts_type_ts %>% 
+             filter(incident_date >= "2025-05-15" & nypd_pct_cd %in% c(5,6,7)), level = NULL, color = "lightgrey") +
+  labs(y = "Call counts") + 
+  facet_wrap(vars(nypd_pct_cd, call_type), scales = "free_y") + 
+  theme_minimal() +
+  labs(title = "Forcasts Across Three Precincts and Call Type", x = "Date", y = "Call counts")
+```
+
+
+```{r Metrics}
+report(fit_type)
+```
+
+```{r}
+accuracy_df <- accuracy(fc_type, data = daily_counts_type_ts)
+accuracy_df %>% filter(nypd_pct_cd == 1)
+```
+
+```{r}
+# Find the best models based on the precinct
+acc_df_type <- accuracy_df %>% group_by(nypd_pct_cd, call_type) %>% slice_min(RMSE, n = 1)
+```
+
