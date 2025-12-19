@@ -1,0 +1,507 @@
+---
+title: 'Time Series: Brooklyn'
+author: "Dirk Hartog"
+date: "2025-10-29"
+output: html_document
+---
+
+```{r load libraries}
+library(tidyverse)
+library(fpp3)
+library(fable)
+library(seasonal)
+library(GGally)
+```
+
+# INTRODUCTION
+
+## Load data 
+
+```{r}
+daily_counts_type <- read_csv("https://raw.githubusercontent.com/D-hartog/DATA698/refs/heads/main/Project%20files/Data/manhattan_dailyCIP_counts.csv")
+head(daily_counts_type)
+```
+
+```{r}
+daily_counts_type %>% group_by(nypd_pct_cd, incident_date) %>% 
+  summarize(num_cip_types = n()) %>% filter(num_cip_types <=1)
+```
+
+
+```{r cip counts, fig.width = 10, fig.height = 6}
+daily_counts_type %>% 
+  mutate(call_type = case_when(
+    cip_jobs == "Non CIP" ~ 1,
+    cip_jobs == "Non Critical" ~ 2,
+    cip_jobs == "Serious" ~ 3,
+    cip_jobs == "Critical" ~ 4)) %>% 
+  ggplot(aes(x = call_type, y = counts)) + geom_bar(stat = "identity", color = "black") +
+  facet_wrap(~ nypd_pct_cd, nrow = 5, ncol = 6, scales = "free") + labs(title = "Values") +  
+  labs(title = "Manhattan: Precinct Call Count By Type",
+       y = "") + 
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+        panel.background = element_rect(fill = "white"),
+        strip.background = element_rect(fill = "lightgrey"),
+        panel.grid.major = element_line(color = "grey", linewidth = 0.5),
+        legend.position = "bottom")
+  
+```
+
+```{r recode cip}
+# Re-code call type into two distinct categories 
+daily_counts_type <- daily_counts_type %>% 
+  mutate(call_type = case_when(
+    cip_jobs == "Non CIP" ~ "Non CIP",
+    cip_jobs == "Non Critical" ~ "CIP",
+    cip_jobs == "Serious" ~ "CIP",
+    cip_jobs == "Critical" ~ "CIP"))
+
+unique(daily_counts_type$call_type)
+
+daily_counts_type_grouped <- daily_counts_type %>% group_by(nypd_pct_cd, incident_date, call_type) %>% summarise(count = sum(counts)) %>% ungroup()
+
+# Use grouped data to see which precincts and dates contain only one type of call 
+daily_counts_type_grouped %>% group_by(nypd_pct_cd, incident_date) %>% 
+  summarize(num_cip_types = n()) %>% filter(num_cip_types <= 1)
+```
+
+
+## Feature Engineering
+
+**Holiday Data**
+
+```{r Read in holiday data}
+holidays <- read_csv("https://raw.githubusercontent.com/D-hartog/DATA698/refs/heads/main/Project%20files/Data/Holidays_cleaned.csv")
+head(holidays)
+holiday_dates <- unique(holidays$Date)
+
+```
+
+### Weater Data 
+
+```{r}
+weather_data <- read_csv("https://raw.githubusercontent.com/D-hartog/DATA698/refs/heads/main/Project%20files/Data/Weather_data_cleaned.csv")
+
+head(weather_data)
+```
+
+```{r recode weather}
+
+weather_data <- weather_data %>% mutate(Prec = as.factor(ifelse(Precipitation <= 0.01, 0, 1)),
+                                SF = as.factor(ifelse(Snowfall <= 0.1 , 0, 1)),
+                                SD = as.factor(ifelse(SnowDepth <= 1, 0, 1)))
+
+```
+
+
+```{r create time series}
+# Create tsibble
+daily_counts_type_ts <- as_tsibble(daily_counts_type_grouped,  
+                                   index = incident_date, 
+                                   key = c(nypd_pct_cd, call_type))
+
+# Aggregate keys 
+daily_counts_type_ts <- daily_counts_type_ts %>% 
+  aggregate_key(nypd_pct_cd * call_type, call_counts = sum(count))
+
+# Engineer date features for possible use 
+daily_counts_type_ts <- daily_counts_type_ts %>% mutate(month = factor(month(incident_date)),
+                      dow = factor(weekdays(incident_date)),
+                      weekend = factor(ifelse(wday(incident_date) %in% c(1,7), 1, 0)),
+                      holiday = factor(ifelse(incident_date %in% holiday_dates, 1, 0))
+)
+
+daily_counts_type_ts <- daily_counts_type_ts %>% 
+  left_join(weather_data, by = join_by(incident_date == Date))
+
+daily_counts_type_ts
+
+#write_csv(daily_counts_type_ts, "Manhattan_full_dataset.csv")
+```
+
+```{r time series plot}
+daily_counts_type_ts %>% filter(nypd_pct_cd %in% c(1,10,19,24),
+                                call_type %in% c("CIP", "Non CIP")) %>% 
+  ggplot(aes(x = incident_date, y = call_counts)) + 
+  geom_line() +
+  facet_wrap(vars(nypd_pct_cd, call_type), nrow = 4, ncol = 2, scales = "free_y") +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+        panel.background = element_rect(fill = "white"),
+        strip.background = element_rect(fill = "lightgrey"),
+        panel.grid.major = element_line(color = "grey", linewidth = 0.5),
+        panel.grid.minor = element_blank(), # Removes minor grid lines
+        strip.text = element_text(colour = "black")) + 
+  labs(title = "Manhattan: Sample Precinct Time Series",
+       x = "Date", y = "Number of calls")
+```
+
+```{r STL NON CIP P1, fig.height = 10, fig.width = 10}
+daily_counts_type_ts %>% filter(nypd_pct_cd == 1, call_type == "Non CIP") %>% 
+  model(
+  STL(call_counts ~ trend(window = 13) + season(window = "periodic"), 
+  robust = TRUE)) %>% # Robust = TRUE downweights any unusual arguments
+  components() %>% 
+  autoplot() + 
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+        panel.background = element_rect(fill = "white"),
+        strip.background = element_rect(fill = "lightgrey"),
+        panel.grid.major = element_line(color = "grey", linewidth = 0.5),
+        panel.grid.minor = element_blank(), # Removes minor grid lines
+        strip.text = element_text(colour = "black")) + 
+  labs(title = "Precinct 1: CIP STL Decomposition",
+       x = "Date", y = "Number of calls")
+```
+
+
+```{r STL CIP P1, fig.height = 10, fig.width = 10}
+daily_counts_type_ts %>% filter(nypd_pct_cd == 1, call_type == "CIP") %>% 
+  model(
+  STL(call_counts ~ trend(window = 13) + season(window = "periodic"), 
+  robust = TRUE)) %>% # Robust = TRUE downweights any unusual arguments
+  components() %>% 
+  autoplot() + 
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+        panel.background = element_rect(fill = "white"),
+        strip.background = element_rect(fill = "lightgrey"),
+        panel.grid.major = element_line(color = "grey", linewidth = 0.5),
+        panel.grid.minor = element_blank(), # Removes minor grid lines
+        strip.text = element_text(colour = "black")) + 
+  labs(title = "Precinct 1: CIP STL Decomposition",
+       x = "Date", y = "Number of calls")
+```
+
+```{r}
+# Check for missing values in the time series 
+
+daily_counts_type_ts %>% count_gaps(.full = TRUE)
+```
+
+```{r }
+# Visualize the gaps in precinct - 5
+daily_counts_type_ts %>% count_gaps(.full = TRUE) %>% 
+  mutate(call_type = factor(call_type), nypd_pct_cd = factor(nypd_pct_cd)) %>% 
+  ggplot(aes(x = nypd_pct_cd, colour = call_type)) +
+  geom_linerange(aes(ymin = .from, ymax = .to)) +
+  geom_point(aes(y = .from)) +
+  geom_point(aes(y = .to)) +
+  coord_flip() + 
+  labs(title = "Time Gaps by Call Type", x = "Precinct", y = "") +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+        panel.background = element_rect(fill = "white"),
+        strip.background = element_rect(fill = "lightgrey"),
+        panel.grid.major = element_line(color = "grey", linewidth = 0.5),
+        legend.position = "bottom")
+```
+
+```{r fill gaps}
+daily_counts_type_ts <- daily_counts_type_ts %>% filter(nypd_pct_cd != 22)
+
+daily_counts_type_ts <- daily_counts_type_ts %>% fill_gaps(.full = TRUE, call_counts = 1)
+```
+
+
+# HIERARCHICAL FORECASTING
+
+## Forecasting total call counts by type
+
+Fit two base models 
+- Auto ETS
+- Auto ARIMA 
+
+1. Fit with training data up to May 31st, 2025 - forecasting 30 days 
+2. Fit with training data up to June 30th, 2024 - forecasting 365 days
+**3. Fit with training data up to June 23rd, 2025 - forecasting for 7 days**
+
+```{r fit hierarchical model}
+set.seed(100)
+fit_type <- daily_counts_type_ts %>% 
+  filter(incident_date <= "2025-06-23") %>% 
+  model(base_ets = ETS(call_counts),
+        base_arima = ARIMA(call_counts,
+                           approximation = TRUE),
+        arima_weather = ARIMA(call_counts ~ dow + AvgTemperature + Prec + SF,
+                           approximation = TRUE)) %>% 
+  reconcile(
+    mint_ets = min_trace(base_ets, method = "mint_shrink"),
+    mint_arima = min_trace(base_arima, method = "mint_shrink"),
+    mint_weather = min_trace(arima_weather, method = "mint_shrink")
+  )
+```
+
+```{r predictor sig}
+arima_models <- c(4,5,7)
+fit_colnames <- colnames(fit_type)
+precincts <- fit_type$nypd_pct_cd
+
+precinct <- c()
+mod_name <- c()
+predictor_list <- c()
+
+for(p in 1:nrow(fit_type)){
+  for(m in arima_models){
+    # get the term summary 
+    model_terms <- fit_type[[m]][[p]][["fit"]][["par"]]
+    # filter for terms that are non significant
+    non_sig <- model_terms %>% filter(p.value > 0.05)
+    # get predictor names
+    term_names <- non_sig$term
+    # print the precinct, model name and the terms that are not significant
+    print(paste0("Precinct: ", precincts[p], " | ", "Model: ", fit_colnames[m], " | ", "Predictors: ", list(term_names)))
+    precinct <- append(precinct, precincts[p])
+    mod_name <- append(mod_name, fit_colnames[m])
+    predictor_list <- append(predictor_list, list(term_names))
+  }
+}
+
+tibble(Precinct = precinct,
+       Model = mod_name,
+       Predictors = predictor_list)
+```
+
+```{r Metrics}
+glance(fit_type)
+```
+
+```{r save fit}
+# Enter the directory where you wish to save the output 
+write_csv(fit_type, "/Users/dirkhartog/Desktop/CUNY_MSDS/DATA_698/R_files/Output/manhattan/ARIMA_ETS/manhattan_fit_type.csv")
+```
+
+```{r fit tidy}
+# Enter the directory where you wish to save the output 
+fit_type_tidied <- fit_type %>% tidy()
+write_csv(fit_type_tidied, "/Users/dirkhartog/Desktop/CUNY_MSDS/DATA_698/R_files/Output/manhattan/ARIMA_ETS/manhattan_fit_type_tidy.csv")
+```
+
+```{r model parameters}
+report(fit_type %>% filter(nypd_pct_cd == 1, call_type == "CIP") %>% select(base_arima))
+```
+
+Extract fitted model 
+
+```{r extract model data}
+# first term is the model cols 3-8
+# second term is the precinct/call type rows 1 - 23
+fit_type[[4]][[1]][["data"]] # actual data with timestamps
+#8,9
+fit_type[[4]][[1]][["fit"]][["est"]] # fitted values with residuals
+
+#[["par"]] = term, estimate, p-val
+fit_type[[4]][[1]][["fit"]][["par"]]
+```
+
+
+```{r precinct diagnostics}
+# fit_arima_exo %>% ggtime::gg_tsresiduals(lag = 21) + theme_minimal()
+precinct_num = 1
+type = "CIP"
+
+fit_type %>% filter(nypd_pct_cd == precinct_num, call_type == type) %>% select(base_arima) %>% ggtime::gg_tsresiduals(lag = 21) +
+  labs(title = paste0("CIP\nmint_arima Residuals - Precinct: ", precinct_num), x = "Date", y = "Call counts") + theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+        panel.background = element_rect(fill = "white"),
+        strip.background = element_rect(fill = "lightgrey",
+                                        color = "lightgrey",
+                                        linewidth = 0),
+        panel.grid.major = element_line(color = "grey", linewidth = 0.5),
+        panel.grid.minor = element_blank(), # Removes minor grid lines
+        strip.text = element_text(colour = "black"))
+
+selected_precinct <- fit_type %>% filter(nypd_pct_cd == precinct_num, , call_type == type)
+
+augment(selected_precinct) %>% features(.innov, ljung_box, lag = 14, dof = 6)
+```
+
+```{r ljung_box scores}
+ljung_box_scores <- augment(fit_type) %>% features(.innov, ljung_box, lag = 14, dof = 6) %>% arrange(nypd_pct_cd, .model)
+ljung_box_scores
+```
+
+Models with white noise residuals 
+
+```{r}
+ljung_box_scores%>% 
+  filter(lb_pvalue >= 0.05) %>% 
+  group_by(nypd_pct_cd, call_type) #%>% summarise(count = n())
+```
+
+### Call Type Forecasts
+
+```{r forecast}
+fc_type <- fit_type %>% forecast(daily_counts_type_ts %>% filter(incident_date > "2025-06-23"))
+```
+
+
+```{r fig.width = 8,fig.height = 8}
+
+# Visualizing the forecasts of 1 precinct across all call types and agg
+
+fc_type %>% filter(nypd_pct_cd == 1) %>% 
+  autoplot(daily_counts_type_ts %>% 
+             filter(incident_date >= "2025-06-15" & nypd_pct_cd == 1), 
+           level = NULL) +
+  facet_wrap(vars(call_type), 
+             nrow = 3, 
+             scales = "free_y", 
+             labeller = labeller(
+               call_type = c("<aggregated>" = "Aggregated",
+               "CIP" = "CIP", 
+              "Non CIP" =  "Non CIP")
+               )) +
+  labs(title = "Forecasts on 7 Day Test Set\nPrecinct 1", x = "Date", y = "Number of calls") + 
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+        panel.background = element_rect(fill = "white"),
+        strip.background = element_rect(fill = "lightgrey",
+                                        color = "lightgrey",
+                                        linewidth = 0,
+                                        linetype = "solid"),
+        panel.grid.major = element_line(color = "grey", linewidth = 0.5),
+        panel.grid.minor = element_blank(), # Removes minor grid lines
+        strip.text = element_text(colour = "black"))
+```
+
+
+```{r Manhattan, fig.width = 8,fig.height = 8}
+
+# Visualizing the forecasts of 1 precinct across all call types and agg
+
+fc_type %>% filter(nypd_pct_cd == "<aggregated>") %>% 
+  autoplot(daily_counts_type_ts %>% 
+             filter(incident_date >= "2025-06-15" & nypd_pct_cd == "<aggregated>"), 
+           level = NULL) +
+  facet_wrap(vars(call_type), 
+             nrow = 3, 
+             scales = "free_y", 
+             labeller = labeller(
+               call_type = c("<aggregated>" = "Aggregated",
+               "CIP" = "CIP", 
+              "Non CIP" =  "Non CIP")
+               )) +
+  labs(title = "Forecasts on 7 Day Test Set\nManhattan", x = "Date", y = "Number of calls") + 
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+        panel.background = element_rect(fill = "white"),
+        strip.background = element_rect(fill = "lightgrey",
+                                        color = "lightgrey",
+                                        linewidth = 0,
+                                        linetype = "solid"),
+        panel.grid.major = element_line(color = "grey", linewidth = 0.5),
+        panel.grid.minor = element_blank(), # Removes minor grid lines
+        strip.text = element_text(colour = "black"))
+```
+
+
+```{r view, fig.width = 16, fig.height = 10}
+fc_type %>% filter(nypd_pct_cd %in% c(1,10,19,24), call_type %in% c("CIP", "Non CIP")) %>% 
+  autoplot(daily_counts_type_ts %>% 
+             filter(incident_date >= "2025-6-01" & nypd_pct_cd %in% c(1,10,19,24)), color = "lightgrey") + 
+  facet_wrap(vars(nypd_pct_cd, call_type), nrow = 4, ncol = 2, scales = "free_y") + 
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+        panel.background = element_rect(fill = "white"),
+        strip.background = element_rect(fill = "lightgrey",
+                                        color = "lightgrey",
+                                        linewidth = 0,
+                                        linetype = "solid"),
+        panel.grid.major = element_line(color = "grey", linewidth = 0.5),
+        panel.grid.minor = element_blank(), # Removes minor grid lines
+        strip.text = element_text(colour = "black")) +
+  labs(title = "ARIMA/ETS - Precinct", x = "Date", y = "Call counts")
+```
+
+
+```{r view precinct 60 forecasts, fig.width = 12}
+# Visualizing the forecasts of 1 precinct across selected call type
+
+fc_type %>% filter(nypd_pct_cd == 1, call_type == "CIP") %>% 
+  autoplot(daily_counts_type_ts %>% 
+             filter(incident_date >= "2025-06-01" & nypd_pct_cd == 1), level = NULL) +
+  labs(title = "Forecasts on 7 Day Test Set\nPrecinct 1-CIP", x = "Date", y = "Call counts") + 
+  facet_wrap(vars(.model), scales = "free_y") + 
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+        panel.background = element_rect(fill = "white"),
+        strip.background = element_rect(fill = "lightgrey"),
+        panel.grid.major = element_line(color = "grey", linewidth = 0.5),
+        panel.grid.minor = element_blank(), # Removes minor grid lines
+        strip.text = element_text(colour = "black"))
+```
+
+```{r fig.width = 12,fig.height = 8}
+
+# Visualizing the forecasts of 1 precinct across selected call type w/ PI
+
+fc_type %>% filter(nypd_pct_cd == 1, call_type == "CIP") %>% 
+  autoplot(daily_counts_type_ts %>% 
+             filter(incident_date >= "2025-06-01" & nypd_pct_cd == 1)) +
+  labs(title = "Forecasts on 7 Day Test Set\nPrecinct 1-CIP", x = "Date", y = "Call counts") + 
+  facet_wrap(vars(call_type, .model), scales = "free_y") + 
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+        panel.background = element_rect(fill = "white"),
+        strip.background = element_rect(fill = "lightgrey"),
+        panel.grid.major = element_line(color = "grey", linewidth = 0.5),
+        panel.grid.minor = element_blank(), # Removes minor grid lines
+        strip.text = element_text(colour = "black"))
+```
+
+
+```{r save forecast}
+
+write_csv(fc_type, "/Users/dirkhartog/Desktop/CUNY_MSDS/DATA_698/R_files/Output/manhattan/ARIMA_ETS/manhattan_forecast.csv")
+```
+
+### Prediction intervals 
+
+Get prediction intervals for all models - all precincts - all call types
+
+```{r prediction intervals}
+fc_type_hilo <- fc_type %>% hilo() %>% select(`80%`, `95%`)
+fc_type_hilo
+write_csv(fc_type_hilo, "/Users/dirkhartog/Desktop/CUNY_MSDS/DATA_698/R_files/Output/manhattan/ARIMA_ETS/manhattan_fc_hilo.csv")
+```
+
+
+```{r}
+accuracy_df <- accuracy(fc_type, data = daily_counts_type_ts)
+write_csv(accuracy_df, "/Users/dirkhartog/Desktop/CUNY_MSDS/DATA_698/R_files/Output/manhattan/ARIMA_ETS/manhattan_fc_accuracy.csv")
+accuracy_df %>% filter(nypd_pct_cd == 1)
+```
+
+## SAVE OUTPUTS
+
+```{r}
+
+# combine model metrics and residual evaluation
+#fit_type %>% glance()
+
+combined_acc_ljung <- fit_type %>% glance() %>% 
+  arrange(nypd_pct_cd, .model) %>% 
+  left_join(ljung_box_scores, 
+            by = join_by(nypd_pct_cd == nypd_pct_cd,
+                         call_type == call_type,
+                         .model == .model))
+
+combined_acc_ljung <- combined_acc_ljung %>%
+  mutate(ar_roots_str = map_chr(ar_roots, ~paste(., collapse = "|")),
+         ma_roots_str = map_chr(ma_roots, ~paste(., collapse = "|"))) %>%
+  select(-c(ar_roots,ma_roots)) # Remove the original list column
+```
+
+```{r}
+write_csv(combined_acc_ljung, "/Users/dirkhartog/Desktop/CUNY_MSDS/DATA_698/R_files/Output/manhattan/ARIMA_ETS/manhattan_model_report.csv")
+```
+
+
+
+```{r}
+# Find the best models based on RMSE
+acc_df_type <- combined_acc_ljung %>% group_by(nypd_pct_cd, call_type) %>% slice_min(RMSE, n = 1)
+lj_df_type <- combined_acc_ljung %>% group_by(nypd_pct_cd, call_type) %>% slice_max(lb_pvalue, n = 1)
+lj_df_type
+```
+To extract only the models that you want from fit_type
+
+- Pivot df longer
+- Filter models 
+- Pivot wider to a mable (?) - would that work
+
+```{r}
+class(fit_type)
+```
+
